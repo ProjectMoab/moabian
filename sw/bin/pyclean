@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+set -euo pipefail
+die() { ret=$?; printf "%s\n", "$@" >&2; exit "$ret"; }
+
+find . -type f -name '*.py[co]' -delete -o -type d -name __pycache__ -delete

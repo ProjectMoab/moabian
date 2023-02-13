@@ -1,0 +1,391 @@
+#!/bin/bash
+# vim:ft=sh ts=4 sw=4 et
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# use :set noet when modifying EOF blocks
+# eventually fix with .editorconfig for VS Code <-- 
+
+## Moabian v3.0 OS Setup
+##
+## Pre-flight checklist for developer: 
+## 
+## 1) cd ~/moab/sw/huemask && make 
+## 2) ensure correct v3.bin firwmare file is checked in to ~/moab/fw
+
+set -euo pipefail   # unofficial bash strict mode
+
+require() { hash "$@" || return -1; }
+println() { printf '%s\n' "$*"; }
+die()     { ret=$?; printf "%s\n" "$@" >&2; exit "$ret"; }
+
+[[ $EUID -eq 0 ]] || die "$0 script needs to run as root. Try sudo $0"
+
+## Log script output
+exec 1> >(tee "/tmp/stdout.log")
+exec 2> >(tee "/tmp/stderr.log")
+
+## Set CWD to the location where this script is running
+## $_D -> full path to folder where script is 
+## $_P -> parent path (usually /home/pi/moab)
+readonly _D="$(dirname "$(readlink -f "$0")")" && cd "$_D"
+readonly _P=$(dirname $_D)
+
+function layer-run-first
+{
+    ## Change default timezone from GMT to PST
+    timedatectl set-timezone America/Los_Angeles && timedatectl
+
+    ## Enable ssh by default for Moab
+    touch /boot/ssh
+
+    apt-get update --allow-releaseinfo-change -y
+}
+
+
+function touch-files
+{
+    ## Keep Pi from grabbing serial port in vain (the HAT hijacks it)
+    ## keeps unnecessary logs from filling journalctl
+    sed -i 's/console=serial0,115200 console=tty1 //' /boot/cmdline.txt
+
+    touch-locale-gen
+    touch-config-txt
+    touch-keyboard
+    touch-console-setup
+}
+
+
+function layer-classic-moabian
+{
+    local packages=(
+        bats
+        git
+        ripgrep
+        tmux
+        vim
+        minicom
+        raspi-gpio
+    )
+    apt-get install --no-install-recommends -y ${packages[*]}
+
+    ## BOOT FASTER
+    rm -f /etc/systemd/system/dhcpd.service.d/wait.conf
+    systemctl disable triggerhappy
+    systemctl disable bluetooth
+    systemctl disable apt-daily
+    systemctl disable apt-daily-upgrade
+    systemctl disable man-db
+
+    rm -f /etc/motd
+    
+    ## /home/pi
+    for f in files/home/*; do
+        dst="/home/pi/.${f##*/}"
+        cp -v -f "$f" "$dst"
+        chown pi:pi "$dst"
+    done
+
+    ## vim plugins
+    sudo -u pi -s <<-'EOF'
+		dest="$HOME/.vim/pack/moabian/start"
+		rm -rf $dest
+		mkdir -p "$dest"
+		git clone https://github.com/lifepillar/vim-solarized8 "$dest/solarized8"
+		git clone https://github.com/scotstan/vim-polyglot "$dest/polyglot"
+	EOF
+
+    ## /home/pi/moab
+    chown -R pi:pi /home/pi/moab
+
+    ## Remove files left over from v2.1
+    rm -f /usr/local/bin/{testmoab,ufetch,motd}
+    ## Remove files from v2.4
+    rm -f /usr/local/lib/libmoab*
+    ## Remove files from v2.5 (now in ~/moab/bin
+    rm -f /usr/local/lib/libbcm2835*
+    rm -f /usr/local/bin/{splash,diagnose,oled}
+
+    ## /etc/environment file sets MOABIAN=3.x.x for all users
+    install -pvm 644 files/etc/* /etc
+}
+
+function layer-pip
+{
+    # Also leverages pre-built binary wheels for Rpi4 via /etc/pip.conf
+    apt-get install -y --no-install-recommends python3-dev
+
+    # Install pip3 via bootstrap.pypa.io as it also installs setuptools
+    # Unable to install reliably with apt-get python3-pip
+    if ! command -v pip3 &> /dev/null; then
+        wget --no-verbose https://bootstrap.pypa.io/get-pip.py -O /tmp/get-pip.py
+        python3 /tmp/get-pip.py
+    else
+        python3 -m pip install --upgrade pip
+    fi
+
+    # Pointer for pip to download pre-compiled Raspberry Pi binary wheels
+    echo "[global]" > /etc/pip.conf
+    echo "extra-index-url=https://www.piwheels.org/simple" >> /etc/pip.conf
+}
+
+##
+## DOCKER-CE and MOBY
+##
+
+
+brain_paths () {
+    docker-compose config | grep "image:" | sed -r 's/.*image: (.+)/\1/'
+}
+
+brain_sha () {
+    docker inspect "$1" | grep Id | sed -r 's/.*:([a-z0-9]*)",/\1/'
+}
+
+save_brains () {
+    require "docker"
+
+    if $(grep "MOABIAN=2" /etc/environment);  then
+		return -1
+	fi
+
+    # Skip moab/control a56e: remnant of v2.4.1 when the controller was in docker
+    # Skip moab/brain 77b0: as it's the classic moab/brain which we download later
+    docker save $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v -e moab/control) -o /tmp/brains.tar
+}
+
+load_brains () {
+    docker load --input /tmp/brains.tar
+}
+
+uninstall_docker_ce () {
+    require "docker"
+	if [[ $(docker --version | grep -i azure) ]]; then
+		echo "Moby installed... "
+		docker --version
+	fi
+
+    # stop everything before continuing
+    systemctl stop menu brain docker iotedge || true
+
+    # purge apt packages
+    apt-get purge -y docker-ce docker-ce-cli
+    apt-get autoremove -y --purge docker-ce docker-ce-cli
+
+    # purge all docker related files
+    rm -rf /var/lib/docker /etc/docker
+    rm -rf /etc/apparmor.d/docker
+    #groupdel docker
+    rm -rf /var/run/docker.sock
+
+    # remove docker ethernet bridge
+    ifconfig docker0 down
+    ip link delete docker0
+}
+
+add_moby_keys () {
+    curl https://packages.microsoft.com/config/debian/stretch/multiarch/prod.list > /etc/apt/sources.list.d/microsoft.list
+    curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/microsoft.gpg
+    apt-get update --allow-releaseinfo-change -y
+}
+
+install_moby () {
+    apt-get install moby-engine -y
+    usermod -aG docker pi
+}
+
+install_docker_compose () {
+    if ! command -v docker-compose &> /dev/null; then
+        curl -SL https://github.com/docker/compose/releases/download/v2.10.2/docker-compose-linux-armv7 -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
+    fi
+}
+
+download_default_brain () {
+    # check for the default brain "moab/brain" with SHA 77b0
+    if [[ $(docker images | grep --invert-match 77b01e) ]]; then
+        wget --no-verbose https://github.com/microsoft/moabian/releases/download/v.2.4.0/brain.77b0.tar.gz -O /tmp/brain.tar.gz
+        docker load < /tmp/brain.tar.gz
+        docker tag 77b0 moab/brain:latest
+    fi
+}
+
+function layer-docker
+{
+    save_brains || true
+    uninstall_docker_ce || true
+    add_moby_keys
+    install_moby
+    install_docker_compose
+    systemctl start docker
+    load_brains || true
+    download_default_brain
+
+    # If docker-compose.yml is from 2.4.1 version, replace it 
+    if grep -q moab-control ../docker-compose.yml ; then 
+        echo "deleting old 2.4 docker-compose.yml"
+        rm ../docker-compose.yml
+    fi
+
+    # Copy template docker-compose if there isn't one
+    cp --no-clobber ../bin/template.yml ../docker-compose.yml
+    chown pi:pi ../docker-compose.yml
+}
+
+
+function layer-moab-services 
+{
+    sudo -u pi python3 -m pip install --user RPi.GPIO
+    services/install
+}
+
+function layer-rename {
+    if grep raspberry /etc/hostname; then
+        sed -i -e 's/raspberrypi/moab/' /etc/hosts /etc/hostname
+        echo "raspberrypi.local renamed to moab.local"
+        warn "Please reboot your Moab now by typing: sudo reboot now"
+    fi
+}
+
+function touched { grep -qF "##moabian" "$1"; }
+
+# Tabs below are STET
+function touch-locale-gen
+{
+    touched /etc/locale.gen && return
+
+    cat <<- EOF >> /etc/locale.gen
+		##moabian
+		en_US.UTF-8 UTF-8
+	EOF
+    locale-gen en_US.UTF-8
+    update-locale LANG=en_US.UTF-8
+}
+
+function touch-config-txt
+{
+    touched /boot/config.txt && return
+    cat <<- EOF >> /boot/config.txt
+		##moabian
+		boot_delay=0
+		disable_splash=1
+		dtoverlay=pi3-disable-bt
+		dtoverlay=uart0
+		dtoverlay=uart1
+		dtoverlay=uart5
+		dtparam=spi=on
+		enable_uart=1
+		hdmi_force_hotplug=1
+		gpio=20=op,dh
+		gpio=5=op,dl
+		gpio=6=op
+		start_x=1
+		gpu_mem=128
+	EOF
+}
+
+function touch-keyboard
+{
+    touched /etc/default/keyboard && return
+    cat <<- EOF >> /etc/default/keyboard
+		##moabian
+		XKBLAYOUT="us"
+		XKMODEL="pc104"
+	EOF
+    setupcon
+}
+
+function touch-console-setup
+{
+    touched /etc/default/console-setup && return
+    cat <<- EOF >> /etc/default/console-setup
+		##moabian
+		FONTFACE="TerminusBold"
+		FONTSIZE="10x20"
+	EOF
+}
+
+function layer-baremetal
+{
+    # install APT packages as root
+    $_P/sw/setup/packages.sh
+
+    info "Installing python packages"
+    sudo -u pi -s <<-EOF
+		python3 -m pip install --upgrade pip
+		pip3 install --user -r $_P/sw/setup/requirements.txt
+		pip3 install --user $_P/sw/huemask
+	EOF
+}
+
+function layer-mcumgr
+{
+    # Install Go language (you have your orders now, go bin go)
+    local go_url="https://golang.org/dl/go1.15.1.linux-armv6l.tar.gz"
+    if ! [ -e /usr/local/go/bin/go ]; then
+        info "installing go"
+        wget --no-verbose $go_url -O /tmp/golang.tar.gz
+        tar -C /usr/local -xzf /tmp/golang.tar.gz
+    fi
+
+    # Install firmware installer program "mcumgr" from Apache
+    if ! [ -e /usr/local/bin/mcumgr ]; then
+       info "installing mcumgr"
+       sudo -u pi -s <<-'EOF'
+			export GOPATH=$HOME/.go
+			mcu_url="github.com/apache/mynewt-mcumgr-cli/mcumgr"
+			/usr/local/go/bin/go get $mcu_url
+			cd $HOME/.go/src/$mcu_url
+			/usr/local/go/bin/go install mcumgr.go
+		EOF
+        cp /home/pi/.go/bin/mcumgr /usr/local/bin
+    fi
+}
+
+function layer-flash-firmware
+{
+    if ! $_P/bin/flash; then
+        warn "Unable to flash firmware. Reboot, then run: sudo moab/bin/flash "
+    fi
+}
+
+function warn { 
+    if tput colors &> /dev/null; then
+        local color=$(tput smso)$(tput setaf 1) # inverse, red
+        local reset=$(tput sgr0)
+        printf '%s\n' "${color}$1${reset}" >&2
+    else 
+        printf '%s\n' "$1"
+    fi
+}
+
+function info { 
+    if tput colors &> /dev/null; then
+        local color=$(tput smso)$(tput setaf 2) # inverse, green
+        local reset=$(tput sgr0)
+        printf '%s\n' "${color}$1${reset}"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+function main
+{
+    info "01: Updating system packages" && layer-run-first
+    info "02: Setting up boot files" && touch-files
+    info "03: Moabian package install" && layer-classic-moabian
+    info "04: Installing python" && layer-pip
+    info "05: Installing docker (moby)" && layer-docker
+    info "06: Installing go and firmware tooling" && layer-mcumgr
+    info "07: Installing python packages for moab" && layer-baremetal
+    info "08: Installing autorun services" && layer-moab-services
+    info "09: Flashing firmware" && layer-flash-firmware
+    info "10: renaming bot to moab" && layer-rename
+    info "FINISHED. Now reboot by typing:"
+    warn "sudo reboot now"
+}
+
+main
+
+exit 0
