@@ -74,6 +74,32 @@ def zero_controller(**kwargs):
     return next_action
 
 
+def nn_controller(filepath="train_moab_weights.npz", **kwargs):
+    npz = np.load(filepath)
+    w0 = npz["w0"]
+    b0 = npz["b0"]
+    w1 = npz["w1"]
+    b1 = npz["b1"]
+    w_out = npz["w_out"]
+
+    def next_action(state):
+        env_state, ball_detected, buttons = state
+        x, y, vel_x, vel_y, sum_x, sum_y = env_state
+        state = np.array([x, y, vel_x, vel_y])
+        action = w_out @ np.tanh(w1 @ np.tanh(w0 @ state + b0) + b1)
+
+        action = np.clip(action * 22, -22, 22)
+        pitch, roll = action
+
+        if ball_detected:
+            # New sims match the coordinates of old sim for compatibility
+            return Vector2(-roll, pitch), {}
+        else:
+            return Vector2(0, 0), {}
+
+    return next_action
+
+
 def brain_controller(
     max_angle=22,
     port=5555,

@@ -31,6 +31,7 @@ from info_screen import (
 )
 from controllers import (
     pid_controller,
+    nn_controller,
     zero_controller,
     brain_controller,
     joystick_controller,
@@ -108,6 +109,12 @@ def build_menu(env, log_on, logfile, kiosk, kiosk_timeout, kiosk_clock_position)
             kwargs={},
             decorators=[log_csv] if log_on else None,
         ),
+        MenuOption(
+            name="NN",
+            closure=nn_controller,
+            kwargs={},
+            decorators=[log_csv] if log_on else None,
+        ),
     ]
     # fmt: on
 
@@ -125,7 +132,8 @@ def build_menu(env, log_on, logfile, kiosk, kiosk_timeout, kiosk_clock_position)
                     "dump_location_clock_hand": kiosk_clock_position,
                     "controller": brain_controller,
                     "controller_kwargs": {
-                        "port": brain_image.port, "alert_fn": alert_callback
+                        "port": brain_image.port,
+                        "alert_fn": alert_callback,
                     },
                 },
                 decorators=[log_csv] if log_on else None,
@@ -314,9 +322,10 @@ def main_menu(
     servo_safety_timeout = settings["servo_safety_timeout"]
     servo_safety_clock_position = settings["servo_safety_clock_position"]
 
-
     with MoabEnv(hertz, debug=debug, verbose=verbose) as env:
-        menu_list = build_menu(env, log, file, kiosk, kiosk_timeout, kiosk_clock_position)
+        menu_list = build_menu(
+            env, log, file, kiosk, kiosk_timeout, kiosk_clock_position
+        )
 
         if cont == -1:
             # normal startup state
